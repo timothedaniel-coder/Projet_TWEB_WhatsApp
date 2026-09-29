@@ -1,23 +1,41 @@
+const util = require('util');
 var net = require('net');
-var client = new net.Socket();
+const readline = require('readline');
+const yargs = require('yargs/yargs');
+const { hideBin } = require('yargs/helpers');
 
-client.connect(8080, '127.0.0.1', function() {
-    console.log('Connected');
-    process.stdout.write('>');
+const debug = util.debuglog('client');
+const argv = yargs(hideBin(process.argv)).argv;
+var client = new net.Socket();
+const PORT = process.env.PORT || 8080;
+const HOST = process.env.HOST || '127.0.0.1';
+
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: '> '
+});
+
+client.connect(PORT, HOST, function() {
+    debug('Connected');
+    client.write(JSON.stringify({
+        "sender": argv.name,
+        "action": "client-hello"
+    }));
 });
 
 client.on('data', function(data) {
-    console.log('Received: ' + data);
+    debug('Received: ' + data);
     process.stdout.write('>');
 });
 
-process.stdin.resume();
-process.stdin.setEncoding('utf8');
-process.stdout.write('>');
-process.stdin.on('data', (text) => {
-    switch(text){
-        case 'hello\n':
+rl.prompt();
+
+rl.on('line', (line) => {
+    switch(line.trim()) {
+        case 'hello':
             client.write(JSON.stringify({"action":"client-hello"}));
             break; 
     }
+    rl.prompt();
 });

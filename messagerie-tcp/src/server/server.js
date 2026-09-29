@@ -1,10 +1,14 @@
+const util = require('util');
+const debug = util.debuglog('server');
 var net = require('net');
+const PORT = process.env.PORT || 8080;
+const HOST = process.env.HOST || '127.0.0.1';
 
 var server = net.createServer((socket) => {
-    console.log('CONNECTED from ' + socket.remoteAddress + ':' + socket.remotePort);
+    debug('CONNECTED from ' + socket.remoteAddress + ':' + socket.remotePort);
     socket.on('data', function(data) {
         msg = JSON.parse(data);
-        console.log('DATA received from '+socket.remoteAddress + ':' + data);
+        debug('DATA received from '+socket.remoteAddress + ':' + data);
 
         switch(msg.action){
             case 'client-hello':
@@ -15,5 +19,6 @@ var server = net.createServer((socket) => {
                 break;
         }
     });
-}).listen(8080, '127.0.0.1');
-
+}).listen(PORT, HOST, () => {
+    debug(`Server listening on ${HOST}:${PORT}`);
+});
