@@ -24,6 +24,22 @@ var server = net.createServer((socket) => {
                     "msg": `Bienvenue ${msg.sender} !`
                 }));
                 break;  
+            case 'client-send':
+                const destSocket = connectedClients.get(msg.dest);
+                
+                if (destSocket) {
+                    destSocket.write(JSON.stringify({
+                        "sender": msg.sender,
+                        "action": "server-send",
+                        "msg": `[Message de ${msg.sender}] : ${msg.msg}`
+                    }));
+                    debug(`Message relayé de ${msg.sender} vers ${msg.dest}`);
+                } else {
+                    socket.write(JSON.stringify({
+                        "msg": `Erreur : L'utilisateur ${msg.dest} n'est pas connecté.`
+                    }));
+                }
+                break;
         }
     });
 }).listen(PORT, HOST, () => {

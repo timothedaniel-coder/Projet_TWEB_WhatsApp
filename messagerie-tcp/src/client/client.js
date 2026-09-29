@@ -36,13 +36,27 @@ client.on('data', function(data) {
 });
 
 rl.on('line', (line) => {
-    switch(line.trim()) {
-        case 'hello':
+    const text = line.trim();
+    
+    if (text === 'hello') {
+        client.write(JSON.stringify({
+            "sender": argv.name,
+            "action": "client-hello"
+        }));
+    } 
+    else if (text.startsWith('s;')) {
+        const parts = text.split(';');         
+        if (parts.length >= 3) {
+            const dest = parts[1];
+            const message = parts.slice(2).join(';');
+            
             client.write(JSON.stringify({
                 "sender": argv.name,
-                "action": "client-hello"
+                "dest": dest,
+                "msg": message,
+                "action": "client-send"
             }));
-            break; 
+        }
     }
     rl.prompt();
 });
