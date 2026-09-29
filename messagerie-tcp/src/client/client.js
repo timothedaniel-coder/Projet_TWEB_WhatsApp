@@ -17,24 +17,31 @@ const rl = readline.createInterface({
 });
 
 client.connect(PORT, HOST, function() {
-    debug('Connected');
-    client.write(JSON.stringify({
+    console.log('Connecté au serveur');
+        client.write(JSON.stringify({
         "sender": argv.name,
-        "action": "client-hello"
+        "action": "client-connect" 
     }));
+    
+    rl.prompt();
 });
 
 client.on('data', function(data) {
-    debug('Received: ' + data);
-    process.stdout.write('>');
+    debug('Traces techniques reçues : ' + data);
+    const parsedData = JSON.parse(data);
+    if (parsedData.msg) {
+        console.log(parsedData.msg); 
+    }
+    rl.prompt();
 });
-
-rl.prompt();
 
 rl.on('line', (line) => {
     switch(line.trim()) {
         case 'hello':
-            client.write(JSON.stringify({"action":"client-hello"}));
+            client.write(JSON.stringify({
+                "sender": argv.name,
+                "action": "client-hello"
+            }));
             break; 
     }
     rl.prompt();

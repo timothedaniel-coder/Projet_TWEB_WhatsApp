@@ -3,6 +3,7 @@ const debug = util.debuglog('server');
 var net = require('net');
 const PORT = process.env.PORT || 8080;
 const HOST = process.env.HOST || '127.0.0.1';
+const connectedClients = new Map();
 
 var server = net.createServer((socket) => {
     debug('CONNECTED from ' + socket.remoteAddress + ':' + socket.remotePort);
@@ -11,12 +12,18 @@ var server = net.createServer((socket) => {
         debug('DATA received from '+socket.remoteAddress + ':' + data);
 
         switch(msg.action){
+            case 'client-connect':
+                connectedClients.set(msg.sender, socket);
+                debug(`Nouveau client enregistré : ${msg.sender}`);
+                break;
+                
             case 'client-hello':
                 socket.write(JSON.stringify({
-                    "sender-ip": socket.remoteAddress+':'+socket.remotePort,
+                    "sender": msg.sender,
                     "action": "server-hello",
-                    "msg": "Hello"}));
-                break;
+                    "msg": `Bienvenue ${msg.sender} !`
+                }));
+                break;  
         }
     });
 }).listen(PORT, HOST, () => {
