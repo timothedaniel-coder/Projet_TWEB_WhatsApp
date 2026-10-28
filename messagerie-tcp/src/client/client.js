@@ -4,7 +4,6 @@ const net = require('net');
 const readline = require('readline');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
-// Importation du module commun
 const { ACTIONS, createMessage, COMMANDS } = require('../common/protocol.js');
 
 const debug = util.debuglog('client');
@@ -21,23 +20,67 @@ const rl = readline.createInterface({
 
 client.connect(PORT, HOST, function() {
     console.log(chalk.green.bold('Connecté au serveur'));
-    client.write(createMessage(ACTIONS.CONNECT, argv.name));
+    client.write(createMessage(ACTIONS.HELLO, argv.name));
     rl.prompt();
 });
 
+let buffer = '';
+
 client.on('data', function(data) {
-    debug('Traces techniques reçues : ' + data);
-    const parsedData = JSON.parse(data);
-    if (parsedData.msg) {
-        // Efface la ligne actuelle pour éviter que le message s'écrive par-dessus le prompt
-        process.stdout.clearLine();
-        process.stdout.cursorTo(0);
+    buffer += data.toString();
+    
+    let boundary = buffer.indexOf('\n');
+    while (boundary !== -1) {
+        const messageStr = buffer.substring(0, boundary).trim();
+        buffer = buffer.substring(boundary + 1);
         
-        if (parsedData.sender === "serveur") {
-            console.log(chalk.yellow(parsedData.msg));
-        } else {
-            console.log(chalk.cyan(parsedData.msg));
+        if (messageStr) {
+            try {
+                const parsedData = JSON.parse(messageStr);
+                
+                process.stdout.clearLine();
+                process.stdout.cursorTo(0);
+                
+                switch (parsedData.action) {
+                    case ACTIONS.SRV_JOINED:
+                        console.log(chalk.yellow(`👋 ${parsedData.user} a rejoint le serveur.`));
+                        break;
+                    case ACTIONS.SRV_LEFT:
+                        console.log(chalk.yellow(`🚪 ${parsedData.user} a quitté le serveur.`));
+                        break;
+                    case ACTIONS.SRV_SEND_ACK:
+                        console.log(chalk.gray(`✓ Message bien envoyé à ${parsedData.dest}.`));
+                        break;
+                    case ACTIONS.SRV_BROADCAST_ACK:
+                        console.log(chalk.gray(`✓ Message diffusé à ${parsedData.count} personne(s).`));
+                        break;
+                    case ACTIONS.SRV_ERROR:
+                        console.log(chalk.red(`Erreur (${parsedData.code}): ${parsedData.msg}`));
+                        break;
+                    case ACTIONS.SRV_LIST:
+                        console.log(chalk.cyan(`Utilisateurs connectés : ${parsedData.clients.join(', ')}`));
+                        break;
+                    case ACTIONS.SRV_SEND:
+                        console.log(chalk.cyan(`[Message privé de ${parsedData.sender}] : ${parsedData.msg}`));
+                        break;
+                    case ACTIONS.SRV_BROADCAST:
+                        console.log(chalk.cyan(`[Diffusion de ${parsedData.sender}] : ${parsedData.msg}`));
+                        break;
+                    case 'server-cgroupe':
+                        console.log(chalk.green(`✓ ${parsedData.msg}`));
+                        break;
+                    case 'server-groups':
+                        const list = parsedData.groups && parsedData.groups.length > 0 ? parsedData.groups.join(', ') : 'Aucun groupe';
+                        console.log(chalk.cyan(`Groupes existants : ${list}`));
+                        break;
+                    default:
+                        if (parsedData.msg) console.log(chalk.cyan(parsedData.msg));
+                }
+            } catch (e) {
+                debug('Erreur JSON côté client : ' + e.message);
+            }
         }
+        boundary = buffer.indexOf('\n');
     }
     rl.prompt();
 });
@@ -53,15 +96,26 @@ rl.on('line', (line) => {
         if (parts.length >= 3) {
             const dest = parts[1];
             const message = parts.slice(2).join(';');
-            client.write(createMessage(ACTIONS.SEND, argv.name, message, dest));
+            client.write(createMessage(ACTIONS.SEND, argv.name, { msg: message, dest: dest }));
         }
     }
     else if (text.startsWith(COMMANDS.BROADCAST)) {
         const message = text.substring(COMMANDS.BROADCAST.length);
-        client.write(createMessage(ACTIONS.BROADCAST, argv.name, message));
+        client.write(createMessage(ACTIONS.BROADCAST, argv.name, { msg: message }));
     }
     else if (text === COMMANDS.LIST) {
         client.write(createMessage(ACTIONS.LIST, argv.name));
+    }
+    else if (text.startsWith(COMMANDS.CREATE_GROUP)) {
+        const groupName = text.substring(COMMANDS.CREATE_GROUP.length).trim();
+        if (groupName) {
+            client.write(createMessage(ACTIONS.CREATE_GROUP, argv.name, { group: groupName }));
+        } else {
+            console.log(chalk.red('Erreur : veuillez spécifier un nom de groupe (ex: cg;wob)'));
+        }
+    }
+    else if (text === COMMANDS.GROUPS) {
+        client.write(createMessage(ACTIONS.LIST_GROUPS, argv.name));
     }
     else if (text === COMMANDS.QUIT) {
         client.write(createMessage(ACTIONS.QUIT, argv.name));
