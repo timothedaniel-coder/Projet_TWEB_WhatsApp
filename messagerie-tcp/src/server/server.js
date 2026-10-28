@@ -13,6 +13,15 @@ var server = net.createServer((socket) => {
 
         switch(msg.action){
             case 'client-connect':
+                // 1. Prévenir les autres avant d'ajouter le nouveau pour ne pas s'auto-notifier
+                connectedClients.forEach((clientSocket, clientName) => {
+                    clientSocket.write(JSON.stringify({
+                        "action": "server-event-join",
+                        "msg": `${msg.sender} a rejoint le serveur.`
+                    }));
+                });
+                
+                // 2. Enregistrer le nouveau client
                 connectedClients.set(msg.sender, socket);
                 debug(`Nouveau client enregistré : ${msg.sender}`);
                 break;
@@ -65,16 +74,31 @@ var server = net.createServer((socket) => {
             case 'client-quit':
                 connectedClients.delete(msg.sender);
                 debug(`Client déconnecté volontairement : ${msg.sender}`);
+                
+                // Prévenir les autres du départ
+                connectedClients.forEach((clientSocket, clientName) => {
+                    clientSocket.write(JSON.stringify({
+                        "action": "server-event-leave",
+                        "msg": `${msg.sender} a quitté le serveur.`
+                    }));
+                });
                 break;
         }
     });
     socket.on('close', () => {
-        // Parcourt la Map pour trouver et supprimer l'utilisateur associé à la socket fermée
         for (let [name, clientSocket] of connectedClients.entries()) {
             if (clientSocket === socket) {
                 connectedClients.delete(name);
                 debug(`Nettoyage automatique : suppression de ${name}`);
-                break;
+                
+                // Prévenir les autres du crash/départ forcé
+                connectedClients.forEach((otherSocket) => {
+                    otherSocket.write(JSON.stringify({
+                        "action": "server-event-leave",
+                        "msg": `${name} a été déconnecté.`
+                    }));
+                });
+                break;  
             }
         }
     });
