@@ -58,5 +58,19 @@ rl.on('line', (line) => {
             }));
         }
     }
+    else if (text.startsWith('b;')) {
+        const message = text.substring(2); // Récupère tout ce qui suit "b;"
+        client.write(JSON.stringify({
+            "sender": argv.name,
+            "msg": message,
+            "action": "client-broadcast"
+        }));
+    }
+    else if (text === 'ls;') {
+        client.write(JSON.stringify({
+            "sender": argv.name,
+            "action": "client-list-clients"
+        }));
+    }
     rl.prompt();
 });

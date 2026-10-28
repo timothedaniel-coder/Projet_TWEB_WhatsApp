@@ -40,6 +40,28 @@ var server = net.createServer((socket) => {
                     }));
                 }
                 break;
+            case 'client-broadcast':
+                connectedClients.forEach((clientSocket, clientName) => {
+                    // Optionnel : éviter de s'envoyer le message à soi-même
+                    if (clientName !== msg.sender) {
+                        clientSocket.write(JSON.stringify({
+                            "sender": msg.sender,
+                            "action": "server-broadcast",
+                            "msg": `[Diffusion de ${msg.sender}] : ${msg.msg}`
+                        }));
+                    }
+                });
+                debug(`Message diffusé par ${msg.sender}`);
+                break;
+            case 'client-list-clients':
+                // Extrait les noms (les clés) de la Map et les rejoint avec une virgule
+                const users = Array.from(connectedClients.keys()).join(', ');
+                
+                socket.write(JSON.stringify({
+                    "action": "server-list-clients",
+                    "msg": `Utilisateurs connectés : ${users}`
+                }));
+                break;
         }
     });
 }).listen(PORT, HOST, () => {
