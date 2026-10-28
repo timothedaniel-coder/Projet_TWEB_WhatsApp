@@ -60,7 +60,9 @@ const COMMANDS = {
     CREATE_GROUP: 'cg;',
     JOIN_GROUP: 'j;',
     GROUP_BROADCAST: 'bg;',
-    GROUPS: 'groups;' // <-- Ligne ajoutée ici
+    GROUPS: 'groups;',
+    GROUP_MEMBERS: 'members;',
+    LEAVE_GROUP: 'leave;'
 };
 
 module.exports = { ACTIONS, createMessage, createError, COMMANDS };

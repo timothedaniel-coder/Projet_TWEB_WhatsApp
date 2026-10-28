@@ -43,16 +43,16 @@ client.on('data', function(data) {
                 
                 switch (parsedData.action) {
                     case ACTIONS.SRV_JOINED:
-                        console.log(chalk.yellow(`👋 ${parsedData.user} a rejoint le serveur.`));
+                        console.log(chalk.yellow(`${parsedData.user} a rejoint le serveur.`));
                         break;
                     case ACTIONS.SRV_LEFT:
-                        console.log(chalk.yellow(`🚪 ${parsedData.user} a quitté le serveur.`));
+                        console.log(chalk.yellow(`${parsedData.user} a quitté le serveur.`));
                         break;
                     case ACTIONS.SRV_SEND_ACK:
-                        console.log(chalk.gray(`✓ Message bien envoyé à ${parsedData.dest}.`));
+                        console.log(chalk.gray(`Message bien envoyé à ${parsedData.dest}.`));
                         break;
                     case ACTIONS.SRV_BROADCAST_ACK:
-                        console.log(chalk.gray(`✓ Message diffusé à ${parsedData.count} personne(s).`));
+                        console.log(chalk.gray(`Message diffusé à ${parsedData.count} personne(s).`));
                         break;
                     case ACTIONS.SRV_ERROR:
                         console.log(chalk.red(`Erreur (${parsedData.code}): ${parsedData.msg}`));
@@ -67,14 +67,24 @@ client.on('data', function(data) {
                         console.log(chalk.cyan(`[Diffusion de ${parsedData.sender}] : ${parsedData.msg}`));
                         break;
                     case 'server-cgroupe':
-                        console.log(chalk.green(`✓ ${parsedData.msg}`));
+                        console.log(chalk.green(`${parsedData.msg}`));
                         break;
                     case 'server-groups':
                         const list = parsedData.groups && parsedData.groups.length > 0 ? parsedData.groups.join(', ') : 'Aucun groupe';
                         console.log(chalk.cyan(`Groupes existants : ${list}`));
                         break;
+                    case 'server-group-joined':
+                        console.log(chalk.magenta(`${parsedData.user} a rejoint le groupe ${parsedData.group}.`));
+                        break;
+                    case 'server-group-left':
+                        console.log(chalk.magenta(`${parsedData.user} a quitté le groupe ${parsedData.group} (${parsedData.reason}).`));
+                        break;
+                    case 'server-members':
+                        console.log(chalk.cyan(`Membres de ${parsedData.group} : ${parsedData.members.join(', ')}`));
+                        break;
                     default:
                         if (parsedData.msg) console.log(chalk.cyan(parsedData.msg));
+                        break;
                 }
             } catch (e) {
                 debug('Erreur JSON côté client : ' + e.message);
@@ -111,7 +121,7 @@ rl.on('line', (line) => {
         if (groupName) {
             client.write(createMessage(ACTIONS.CREATE_GROUP, argv.name, { group: groupName }));
         } else {
-            console.log(chalk.red('Erreur : veuillez spécifier un nom de groupe (ex: cg;wob)'));
+            console.log(chalk.red('Erreur : veuillez spécifier un nom de groupe'));
         }
     }
     else if (text === COMMANDS.GROUPS) {
@@ -121,6 +131,15 @@ rl.on('line', (line) => {
         client.write(createMessage(ACTIONS.QUIT, argv.name));
         client.end();
         process.exit(0);
+    }
+    else if (text.startsWith(COMMANDS.JOIN_GROUP)) {
+        client.write(createMessage(ACTIONS.JOIN_GROUP, argv.name, { group: text.substring(COMMANDS.JOIN_GROUP.length).trim() }));
+    }
+    else if (text.startsWith(COMMANDS.GROUP_MEMBERS)) {
+        client.write(createMessage(ACTIONS.GROUP_MEMBERS, argv.name, { group: text.substring(COMMANDS.GROUP_MEMBERS.length).trim() }));
+    }
+    else if (text.startsWith(COMMANDS.LEAVE_GROUP)) {
+        client.write(createMessage(ACTIONS.LEAVE_GROUP, argv.name, { group: text.substring(COMMANDS.LEAVE_GROUP.length).trim() }));
     }
     rl.prompt();
 });

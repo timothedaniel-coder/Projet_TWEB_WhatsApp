@@ -145,6 +145,42 @@ function handleClientMessage(msg, socket) {
         default:
             socket.write(createError('unknown-action', 'Action non reconnue.'));
             break;
+            
+        case ACTIONS.JOIN_GROUP:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupToJoin = groups.get(msg.group);
+            if (groupToJoin.members.has(msg.sender)) return socket.write(createError('already-member', 'Déjà membre.'));
+            
+            groupToJoin.members.add(msg.sender);
+            
+            // Diffuser l'arrivée à tous les membres du groupe (incluant le nouveau)
+            groupToJoin.members.forEach(member => {
+                const memberSocket = connectedClients.get(member);
+                if (memberSocket) memberSocket.write(createMessage('server-group-joined', "serveur", { group: msg.group, user: msg.sender }));
+            });
+            break;
+
+        case ACTIONS.GROUP_MEMBERS:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupMembers = groups.get(msg.group);
+            if (!groupMembers.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
+            
+            socket.write(createMessage('server-members', "serveur", { group: msg.group, members: Array.from(groupMembers.members) }));
+            break;
+
+        case ACTIONS.LEAVE_GROUP:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupToLeave = groups.get(msg.group);
+            if (!groupToLeave.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
+            
+            groupToLeave.members.delete(msg.sender);
+            
+            socket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.sender, reason: 'leave' }));
+            groupToLeave.members.forEach(member => {
+                const memberSocket = connectedClients.get(member);
+                if (memberSocket) memberSocket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.sender, reason: 'leave' }));
+            });
+            break;
     }
 }
 
