@@ -65,7 +65,7 @@ const server = net.createServer((socket) => {
 });
 
 function handleClientMessage(msg, socket) {
-    const clientIdentity = msg.sender || msg.name; // Gère l'exception de la commande groups
+    const clientIdentity = msg.sender || msg.name; 
     debug(`Action reçue : ${msg.action} par ${clientIdentity}`);
 
     if (msg.action !== ACTIONS.HELLO && !connectedClients.has(clientIdentity)) {
@@ -121,7 +121,6 @@ function handleClientMessage(msg, socket) {
             socket.end();
             break;
             
-        // ---- NOUVEAUX CAS POUR LES GROUPES ----
         case ACTIONS.CREATE_GROUP:
             if (!msg.group || typeof msg.group !== 'string') {
                 socket.write(createError('invalid-message', 'Nom de groupe invalide.'));
@@ -134,26 +133,25 @@ function handleClientMessage(msg, socket) {
             const newGroup = new Group(msg.group, msg.sender);
             groups.set(msg.group, newGroup);
             socket.write(createMessage('server-cgroupe', "serveur", { group: msg.group, msg: `Groupe ${msg.group} créé avec succès.` }));
-            debug(`Groupe créé : ${msg.group} par ${msg.sender}`);
             break;
 
         case ACTIONS.LIST_GROUPS:
             const groupNames = Array.from(groups.keys());
             socket.write(createMessage('server-groups', "serveur", { groups: groupNames }));
             break;
-            
-        default:
-            socket.write(createError('unknown-action', 'Action non reconnue.'));
-            break;
-            
+
         case ACTIONS.JOIN_GROUP:
             if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
             const groupToJoin = groups.get(msg.group);
             if (groupToJoin.members.has(msg.sender)) return socket.write(createError('already-member', 'Déjà membre.'));
+            // Vérification du bannissement
+            if (groupToJoin.banned.has(msg.sender)) return socket.write(createError('banned', 'Vous êtes banni de ce groupe.'));
+            // Vérification de l'invitation
+            if (!groupToJoin.invited.has(msg.sender)) return socket.write(createError('not-invited', 'Vous n\'êtes pas invité dans ce groupe.'));
             
+            groupToJoin.invited.delete(msg.sender); // On consomme l'invitation
             groupToJoin.members.add(msg.sender);
             
-            // Diffuser l'arrivée à tous les membres du groupe (incluant le nouveau)
             groupToJoin.members.forEach(member => {
                 const memberSocket = connectedClients.get(member);
                 if (memberSocket) memberSocket.write(createMessage('server-group-joined', "serveur", { group: msg.group, user: msg.sender }));
@@ -181,9 +179,123 @@ function handleClientMessage(msg, socket) {
                 if (memberSocket) memberSocket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.sender, reason: 'leave' }));
             });
             break;
+
+        case ACTIONS.GROUP_BROADCAST:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const targetGroup = groups.get(msg.group);
+            
+            if (!targetGroup.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre de ce groupe.'));
+            
+            targetGroup.messages.push({ sender: msg.sender, msg: msg.msg });
+            
+            let groupCount = 0;
+            targetGroup.members.forEach(member => {
+                if (member !== msg.sender) {
+                    const memberSocket = connectedClients.get(member);
+                    if (memberSocket) {
+                        memberSocket.write(createMessage('server-gmessage', msg.sender, { group: msg.group, msg: msg.msg }));
+                        groupCount++;
+                    }
+                }
+            });
+            
+            socket.write(createMessage('server-gbroadcast', "serveur", { group: msg.group, count: groupCount }));
+            break;
+
+        case ACTIONS.GROUP_MESSAGES:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupHistory = groups.get(msg.group);
+            
+            if (!groupHistory.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
+            
+            socket.write(createMessage('server-msgs', "serveur", { group: msg.group, msgs: groupHistory.messages }));
+            break;
+        
+        case ACTIONS.INVITE:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupToInvite = groups.get(msg.group);
+            
+            // Le contrat impose que seul le créateur puisse inviter
+            if (groupToInvite.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut inviter.'));
+            
+            groupToInvite.invited.add(msg.user);
+            
+            // On notifie la cible si elle est en ligne
+            const invitedSocket = connectedClients.get(msg.user);
+            if (invitedSocket) {
+                invitedSocket.write(createMessage('server-invited', msg.sender, { group: msg.group }));
+            }
+            break;
+
+        case ACTIONS.KICK:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupToKick = groups.get(msg.group);
+            if (groupToKick.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut expulser.'));
+            
+            if (groupToKick.members.has(msg.user)) {
+                groupToKick.members.delete(msg.user);
+                
+                const kickedSocket = connectedClients.get(msg.user);
+                if (kickedSocket) kickedSocket.write(createMessage('server-kicked', msg.sender, { group: msg.group, reason: 'kick' }));
+                
+                groupToKick.members.forEach(member => {
+                    const memberSocket = connectedClients.get(member);
+                    if (memberSocket) memberSocket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.user, reason: 'kick' }));
+                });
+            }
+            break;
+
+        case ACTIONS.BAN:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupToBan = groups.get(msg.group);
+            if (groupToBan.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut bannir.'));
+            
+            groupToBan.banned.add(msg.user);
+            if (groupToBan.members.has(msg.user)) {
+                groupToBan.members.delete(msg.user);
+                
+                const bannedSocket = connectedClients.get(msg.user);
+                if (bannedSocket) bannedSocket.write(createMessage('server-banned', msg.sender, { group: msg.group, reason: 'ban' }));
+                
+                groupToBan.members.forEach(member => {
+                    const memberSocket = connectedClients.get(member);
+                    if (memberSocket) memberSocket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.user, reason: 'ban' }));
+                });
+            }
+            break;
+
+        case ACTIONS.UNBAN:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupToUnban = groups.get(msg.group);
+            if (groupToUnban.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut débannir.'));
+            
+            groupToUnban.banned.delete(msg.user);
+            const unbannedSocket = connectedClients.get(msg.user);
+            if (unbannedSocket) unbannedSocket.write(createMessage('server-unbanned', msg.sender, { group: msg.group }));
+            break;
+        
+        case ACTIONS.STATES:
+            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            const groupState = groups.get(msg.group);
+            
+            // Le contrat réserve l'action states aux membres
+            if (!groupState.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
+            
+            socket.write(createMessage('server-states', "serveur", { 
+                group: msg.group, 
+                owner: groupState.creator,
+                members: Array.from(groupState.members),
+                invited: Array.from(groupState.invited),
+                banned: Array.from(groupState.banned)
+            }));
+            break;
+
+        default:
+            socket.write(createError('unknown-action', 'Action non reconnue.'));
+            break;
     }
 }
 
 server.listen(PORT, HOST, () => {
     debug(`Server listening on ${HOST}:${PORT}`);
-});
+}); 

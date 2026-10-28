@@ -82,6 +82,48 @@ client.on('data', function(data) {
                     case 'server-members':
                         console.log(chalk.cyan(`Membres de ${parsedData.group} : ${parsedData.members.join(', ')}`));
                         break;
+                    case 'server-gmessage':
+                        console.log(chalk.cyan(`[Groupe ${parsedData.group}] Message de ${parsedData.sender} : ${parsedData.msg}`));
+                        break;
+                    case 'server-gbroadcast':
+                        console.log(chalk.gray(`Message diffusé au groupe ${parsedData.group} (${parsedData.count} personne(s)).`));
+                        break;
+                    case 'server-msgs':
+                        console.log(chalk.cyan(`\n--- Historique du groupe ${parsedData.group} ---`));
+                        if (parsedData.msgs && parsedData.msgs.length > 0) {
+                            parsedData.msgs.forEach(m => {
+                                console.log(chalk.cyan(`[${m.sender}] : ${m.msg}`));
+                            });
+                        } else {
+                            console.log(chalk.gray('Aucun message dans ce groupe.'));
+                        }
+                        console.log(chalk.cyan(`-------------------------------------\n`));
+                        break;
+                    case 'server-invited':
+                        console.log(chalk.magenta(`${parsedData.sender} vous a invité à rejoindre le groupe ${parsedData.group}. (Tapez join;${parsedData.group})`));
+                        break;
+                    case 'server-kicked':
+                        console.log(chalk.red(`Vous avez été expulsé du groupe ${parsedData.group} par ${parsedData.sender}.`));
+                        break;
+                    case 'server-banned':
+                        console.log(chalk.red(`Vous avez été banni du groupe ${parsedData.group} par ${parsedData.sender}.`));
+                        break;
+                    case 'server-unbanned':
+                        console.log(chalk.green(`${parsedData.sender} a levé votre bannissement du groupe ${parsedData.group}.`));
+                        break;
+                    case 'server-states':
+                        console.log(chalk.cyan(`\n--- État du groupe ${parsedData.group} ---`));
+                        console.log(chalk.cyan(`Propriétaire : ${parsedData.owner}`));
+                        console.log(chalk.cyan(`Membres      : ${parsedData.members.join(', ')}`));
+                        if (parsedData.invited && parsedData.invited.length > 0) {
+                            console.log(chalk.cyan(`Invités      : ${parsedData.invited.join(', ')}`));
+                        }
+                        if (parsedData.banned && parsedData.banned.length > 0) {
+                            console.log(chalk.red(`Bannis       : ${parsedData.banned.join(', ')}`));
+                        }
+                        console.log(chalk.cyan(`-------------------------------------\n`));
+                        break;
+                    
                     default:
                         if (parsedData.msg) console.log(chalk.cyan(parsedData.msg));
                         break;
@@ -140,6 +182,43 @@ rl.on('line', (line) => {
     }
     else if (text.startsWith(COMMANDS.LEAVE_GROUP)) {
         client.write(createMessage(ACTIONS.LEAVE_GROUP, argv.name, { group: text.substring(COMMANDS.LEAVE_GROUP.length).trim() }));
+    }
+    else if (text.startsWith(COMMANDS.GROUP_BROADCAST)) {
+        const parts = text.split(';');         
+        if (parts.length >= 3) {
+            const groupName = parts[1];
+            const message = parts.slice(2).join(';');
+            client.write(createMessage(ACTIONS.GROUP_BROADCAST, argv.name, { group: groupName, msg: message }));
+        } else {
+            console.log(chalk.red('Erreur : format attendu gbroadcast;groupe;message'));
+        }
+    }
+    else if (text.startsWith(COMMANDS.GROUP_MESSAGES)) {
+        client.write(createMessage(ACTIONS.GROUP_MESSAGES, argv.name, { group: text.substring(COMMANDS.GROUP_MESSAGES.length).trim() }));
+    }
+    else if (text.startsWith(COMMANDS.INVITE)) {
+        const parts = text.split(';');         
+        if (parts.length >= 3) {
+            client.write(createMessage(ACTIONS.INVITE, argv.name, { group: parts[1], user: parts[2] }));
+        } else {
+            console.log(chalk.red('Erreur : format attendu invite;groupe;pseudo'));
+        }
+    }
+    else if (text.startsWith(COMMANDS.KICK) || text.startsWith(COMMANDS.BAN) || text.startsWith(COMMANDS.UNBAN)) {
+        const parts = text.split(';');
+        if (parts.length >= 3) {
+            let action;
+            if (text.startsWith(COMMANDS.KICK)) action = ACTIONS.KICK;
+            else if (text.startsWith(COMMANDS.BAN)) action = ACTIONS.BAN;
+            else action = ACTIONS.UNBAN;
+            
+            client.write(createMessage(action, argv.name, { group: parts[1], user: parts[2] }));
+        } else {
+            console.log(chalk.red('Erreur : format attendu action;groupe;pseudo'));
+        }
+    }
+    else if (text.startsWith(COMMANDS.STATES)) {
+        client.write(createMessage(ACTIONS.STATES, argv.name, { group: text.substring(COMMANDS.STATES.length).trim() }));
     }
     rl.prompt();
 });

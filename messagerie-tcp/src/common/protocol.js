@@ -44,25 +44,32 @@ function createMessage(action, sender, extraFields = {}) {
     return JSON.stringify(payload) + '\n';
 }
 
-// Nouvelle fonction pour respecter le format d'erreur du contrat
+// Fonction pour respecter le format d'erreur du contrat
 function createError(code, msg) {
     return JSON.stringify({ action: ACTIONS.SRV_ERROR, code, msg }) + '\n';
 }
 
 // 3. Module des commandes utilisateurs
 const COMMANDS = {
-    QUIT: 'q;',
+    QUIT: 'quit;',
     LIST: 'ls;',
     BROADCAST: 'b;',
-    SEND: 's;',
+    SEND: 'send;',
     HELLO: 'hello',
     // Commandes Partie 2
     CREATE_GROUP: 'cg;',
-    JOIN_GROUP: 'j;',
-    GROUP_BROADCAST: 'bg;',
+    JOIN_GROUP: 'join;',
+    GROUP_BROADCAST: 'gbroadcast;',
     GROUPS: 'groups;',
     GROUP_MEMBERS: 'members;',
-    LEAVE_GROUP: 'leave;'
+    LEAVE_GROUP: 'leave;',
+    GROUP_MESSAGES: 'msgs;',
+    INVITE: 'invite;',
+    INVITE: 'invite;',
+    KICK: 'kick;',
+    BAN: 'ban;',
+    UNBAN: 'unban;',
+    STATES: 'states;'
 };
 
 module.exports = { ACTIONS, createMessage, createError, COMMANDS };
