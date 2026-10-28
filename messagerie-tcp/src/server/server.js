@@ -62,7 +62,25 @@ var server = net.createServer((socket) => {
                     "msg": `Utilisateurs connectés : ${users}`
                 }));
                 break;
+            case 'client-quit':
+                connectedClients.delete(msg.sender);
+                debug(`Client déconnecté volontairement : ${msg.sender}`);
+                break;
         }
+    });
+    socket.on('close', () => {
+        // Parcourt la Map pour trouver et supprimer l'utilisateur associé à la socket fermée
+        for (let [name, clientSocket] of connectedClients.entries()) {
+            if (clientSocket === socket) {
+                connectedClients.delete(name);
+                debug(`Nettoyage automatique : suppression de ${name}`);
+                break;
+            }
+        }
+    });
+
+    socket.on('error', (err) => {
+        debug(`Erreur réseau sur une socket : ${err.message}`);
     });
 }).listen(PORT, HOST, () => {
     debug(`Server listening on ${HOST}:${PORT}`);

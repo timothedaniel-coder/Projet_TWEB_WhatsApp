@@ -72,5 +72,13 @@ rl.on('line', (line) => {
             "action": "client-list-clients"
         }));
     }
+    else if (text === 'q;') {
+        client.write(JSON.stringify({
+            "sender": argv.name,
+            "action": "client-quit"
+        }));
+        client.end(); // Ferme la connexion TCP proprement
+        process.exit(0); // Quitte le programme Node.js
+    }
     rl.prompt();
 });
