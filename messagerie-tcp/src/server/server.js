@@ -1,6 +1,9 @@
 const util = require('util');
 const net = require('net');
 const { ACTIONS, createMessage, createError } = require('../common/protocol.js');
+const { initDatabase, saveMessage, getUserHistory } = require('./database.js');
+const { register, login } = require('./auth.js');
+const { generateKeyPair, deriveSessionKeys, encryptMessage, decryptMessage } = require('../common/crypto.js');
 
 const debug = util.debuglog('server');
 const PORT = process.env.PORT || 8080;
@@ -21,25 +24,65 @@ class Group {
     }
 }
 
+function sendToSocket(socket, payloadObject) {
+    if (socket.session && socket.session.keys) {
+        const { encKey, macKey } = socket.session.keys;
+        const encryptedJson = encryptMessage(payloadObject, encKey, macKey, socket.session.seqOut);
+        socket.session.seqOut++;
+        socket.write(encryptedJson + '\n');
+    } else {
+        socket.write(JSON.stringify(payloadObject) + '\n');
+    }
+}
+
 const server = net.createServer((socket) => {
     debug('CONNECTED from ' + socket.remoteAddress + ':' + socket.remotePort);
     
+    // Contexte de session attaché à la connexion TCP
+    socket.session = {
+        ecdh: null,
+        keys: null,
+        seqIn: 0,
+        seqOut: 0,
+        user: null // Objet { id, name } une fois authentifié
+    };
+
     let buffer = ''; 
 
     socket.on('data', function(data) {
         buffer += data.toString();
-        
+
         let boundary = buffer.indexOf('\n');
         while (boundary !== -1) {
             const messageStr = buffer.substring(0, boundary).trim();
             buffer = buffer.substring(boundary + 1);
-            
+
             if (messageStr) {
                 try {
-                    const msg = JSON.parse(messageStr);
-                    handleClientMessage(msg, socket);
+                    let msg = JSON.parse(messageStr);
+
+                    // 1. Étape non chiffrée : Handshake ECDH
+                    if (msg.action === ACTIONS.KEY_EXCHANGE) {
+                        handleKeyExchange(msg, socket);
+                    } 
+                    // 2. Échanges chiffrés obligatoire une fois les clés établies
+                    else if (socket.session.keys) {
+                        const decryptedMsg = decryptMessage(
+                            messageStr,
+                            socket.session.keys.encKey,
+                            socket.session.keys.macKey,
+                            socket.session.seqIn
+                        );
+                        socket.session.seqIn++;
+                        handleClientMessage(decryptedMsg, socket);
+                    } 
+                    // 3. Tentative de communication sans handshake préalable
+                    else {
+                        socket.write(createError('sec-error', 'Handshake cryptographique requis.'));
+                    }
                 } catch (e) {
-                    socket.write(createError('invalid-json', 'Format JSON invalide'));
+                    debug('Erreur de traitement :', e.message);
+                    sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'invalid-msg', msg: e.message });
                 }
             }
             boundary = buffer.indexOf('\n');
@@ -47,15 +90,14 @@ const server = net.createServer((socket) => {
     });
 
     socket.on('close', () => {
-        for (let [name, clientSocket] of connectedClients.entries()) {
-            if (clientSocket === socket) {
-                connectedClients.delete(name);
-                debug(`Nettoyage : suppression de ${name}`);
-                connectedClients.forEach((otherSocket) => {
-                    otherSocket.write(createMessage(ACTIONS.SRV_LEFT, "serveur", { user: name }));
-                });
-                break;
-            }
+        if (socket.session.user) {
+            const userName = socket.session.user.name;
+            connectedClients.delete(userName);
+            debug(`Nettoyage : suppression de ${userName}`);
+            
+            connectedClients.forEach((otherSocket) => {
+                sendToSocket(otherSocket, { action: ACTIONS.SRV_LEFT, sender: "serveur", user: userName });
+            });
         }
     });
 
@@ -64,238 +106,312 @@ const server = net.createServer((socket) => {
     });
 });
 
-function handleClientMessage(msg, socket) {
-    const clientIdentity = msg.sender || msg.name; 
-    debug(`Action reçue : ${msg.action} par ${clientIdentity}`);
+/**
+ * Traite la négociation de clés ECDH
+ */
+function handleKeyExchange(msg, socket) {
+    if (!msg.publicKey) {
+        return socket.write(createError('invalid-key', 'Clé publique client manquante.'));
+    }
 
-    if (msg.action !== ACTIONS.HELLO && !connectedClients.has(clientIdentity)) {
-        socket.write(createError('not-registered', 'Vous devez faire un hello d\'abord.'));
+    // Générer la paire ECDH serveur
+    const serverKey = generateKeyPair();
+    socket.session.ecdh = serverKey.ecdh;
+
+    // Dériver les deux clés partagées (chiffrement + mac)
+    socket.session.keys = deriveSessionKeys(serverKey.ecdh, msg.publicKey);
+
+    // Répondre en clair avec la clé publique du serveur
+    const response = {
+        action: ACTIONS.SRV_KEY_EXCHANGE,
+        publicKey: serverKey.publicKeyHex
+    };
+    socket.write(JSON.stringify(response) + '\n');
+    debug('Handshake ECDH accompli avec succès.');
+}
+
+/**
+ * Traite les commandes métier une fois la connexion chiffrée
+ */
+async function handleClientMessage(msg, socket) {
+    const clientIdentity = socket.session.user ? socket.session.user.name : (msg.sender || msg.name);
+    debug(`Action chiffrée reçue : ${msg.action} par ${clientIdentity}`);
+
+    // Exiger l'authentification (LOGIN ou REGISTER) pour toutes les actions métier, sauf si déjà connecté
+    const publicActions = [ACTIONS.REGISTER, ACTIONS.LOGIN, ACTIONS.HELLO];
+    if (!publicActions.includes(msg.action) && !socket.session.user) {
+        sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-authenticated', msg: 'Veuillez vous connecter avec register ou login d\'abord.' });
         return;
     }
 
-    switch(msg.action){
-        case ACTIONS.HELLO:
-            if (connectedClients.has(msg.sender)) {
-                socket.write(createError('already-registered', 'Pseudo déjà utilisé.'));
-                return;
+    switch(msg.action) {
+        // --- PARTIE 3 : AUTHENTIFICATION & HISTORIQUE ---
+        case ACTIONS.REGISTER:
+            try {
+                const newUser = await register(msg.sender, msg.password);
+                // 1. Déclarer le client comme connecté (auto-login après inscription)
+                socket.session.user = newUser;
+                connectedClients.set(newUser.name, socket);
+
+                // 2. Notifier les autres utilisateurs
+                connectedClients.forEach((clientSocket, name) => {
+                    if (name !== newUser.name) {
+                        sendToSocket(clientSocket, { action: ACTIONS.SRV_JOINED, sender: "serveur", user: newUser.name });
+                    }
+                });
+
+                // 3. Confirmer à l'utilisateur
+                sendToSocket(socket, { action: ACTIONS.SRV_AUTH_OK, sender: "serveur", msg: `Compte ${newUser.name} créé avec succès.` });
+            } catch (err) {
+                sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: err.code || 'reg-failed', msg: err.message });
             }
-            connectedClients.forEach((clientSocket) => {
-                clientSocket.write(createMessage(ACTIONS.SRV_JOINED, "serveur", { user: msg.sender }));
-            });
-            connectedClients.set(msg.sender, socket);
-            socket.write(createMessage(ACTIONS.SRV_HELLO, msg.sender, { msg: `Bienvenue ${msg.sender} !` }));
-            break;  
-            
+            break;
+
+        case ACTIONS.LOGIN:
+            try {
+                const user = await login(msg.sender, msg.password);
+
+                if (connectedClients.has(user.name)) {
+                    sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'already-connected', msg: 'Compte déjà connecté ailleurs.' });
+                    return;
+                }
+
+                socket.session.user = user;
+                connectedClients.set(user.name, socket);
+
+                // Notifier les autres utilisateurs
+                connectedClients.forEach((clientSocket, name) => {
+                    if (name !== user.name) {
+                        sendToSocket(clientSocket, { action: ACTIONS.SRV_JOINED, sender: "serveur", user: user.name });
+                    }
+                });
+
+                sendToSocket(socket, { action: ACTIONS.SRV_AUTH_OK, sender: user.name, msg: `Bienvenue ${user.name} !` });
+            } catch (err) {
+                sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: err.code || 'auth-failed', msg: err.message });
+            }
+            break;
+
+        case ACTIONS.HISTORY:
+            try {
+                const history = await getUserHistory(socket.session.user.id);
+                sendToSocket(socket, { action: ACTIONS.SRV_HISTORY, sender: "serveur", history: history });
+            } catch (err) {
+                sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'db-error', msg: err.message });
+            }
+            break;
+
+        // --- PARTIE 1 : MESSAGERIE DE BASE ---
+        case ACTIONS.HELLO:
+            if (socket.session.user) {
+                sendToSocket(socket, { action: ACTIONS.SRV_HELLO, sender: socket.session.user.name, msg: `Bonjour ${socket.session.user.name} !` });
+            } else {
+                sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'auth-required', msg: 'Utilisez client-login ou client-register.' });
+            }
+            break;
+
         case ACTIONS.SEND:
             const destSocket = connectedClients.get(msg.dest);
             if (destSocket) {
-                if (msg.sender === msg.dest) {
-                    socket.write(createError('recipient-is-self', 'Vous ne pouvez pas vous envoyer de message.'));
+                if (socket.session.user.name === msg.dest) {
+                    sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'recipient-is-self', msg: 'Vous ne pouvez pas vous envoyer de message.' });
                     return;
                 }
-                destSocket.write(createMessage(ACTIONS.SRV_SEND, msg.sender, { dest: msg.dest, msg: msg.msg }));
-                socket.write(createMessage(ACTIONS.SRV_SEND_ACK, "serveur", { dest: msg.dest }));
+                
+                sendToSocket(destSocket, { action: ACTIONS.SRV_SEND, sender: socket.session.user.name, dest: msg.dest, msg: msg.msg });
+                sendToSocket(socket, { action: ACTIONS.SRV_SEND_ACK, sender: "serveur", dest: msg.dest });
+                await saveMessage(socket.session.user.id, 'private_sent', `À ${msg.dest}: ${msg.msg}`);
             } else {
-                socket.write(createError('recipient-not-found', `L'utilisateur ${msg.dest} n'est pas connecté.`));
+                sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'recipient-not-found', msg: `L'utilisateur ${msg.dest} n'est pas connecté.` });
             }
             break;
-            
+
         case ACTIONS.BROADCAST:
             let count = 0;
             connectedClients.forEach((clientSocket, clientName) => {
-                if (clientName !== msg.sender) {
-                    clientSocket.write(createMessage(ACTIONS.SRV_BROADCAST, msg.sender, { msg: msg.msg }));
+                if (clientName !== socket.session.user.name) {
+                    sendToSocket(clientSocket, { action: ACTIONS.SRV_BROADCAST, sender: socket.session.user.name, msg: msg.msg });
                     count++;
                 }
             });
-            socket.write(createMessage(ACTIONS.SRV_BROADCAST_ACK, "serveur", { count: count }));
+            sendToSocket(socket, { action: ACTIONS.SRV_BROADCAST_ACK, sender: "serveur", count: count });
+            await saveMessage(socket.session.user.id, 'broadcast', msg.msg);
             break;
-            
+
         case ACTIONS.LIST:
             const users = Array.from(connectedClients.keys());
-            socket.write(createMessage(ACTIONS.SRV_LIST, "serveur", { clients: users }));
+            sendToSocket(socket, { action: ACTIONS.SRV_LIST, sender: "serveur", clients: users });
             break;
-            
+
         case ACTIONS.QUIT:
-            socket.write(createMessage(ACTIONS.SRV_QUIT, "serveur", { msg: "Déconnexion confirmée." }));
+            sendToSocket(socket, { action: ACTIONS.SRV_QUIT, sender: "serveur", msg: "Déconnexion confirmée." });
             socket.end();
             break;
-            
+
+        // --- PARTIE 2 : GROUPES ---
         case ACTIONS.CREATE_GROUP:
             if (!msg.group || typeof msg.group !== 'string') {
-                socket.write(createError('invalid-message', 'Nom de groupe invalide.'));
-                return;
+                return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'invalid-message', msg: 'Nom de groupe invalide.' });
             }
             if (groups.has(msg.group)) {
-                socket.write(createError('already-exists', `Le groupe ${msg.group} existe déjà.`));
-                return;
+                return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'already-exists', msg: `Le groupe ${msg.group} existe déjà.` });
             }
-            const newGroup = new Group(msg.group, msg.sender);
+            const newGroup = new Group(msg.group, socket.session.user.name);
             groups.set(msg.group, newGroup);
-            socket.write(createMessage('server-cgroupe', "serveur", { group: msg.group, msg: `Groupe ${msg.group} créé avec succès.` }));
+            sendToSocket(socket, { action: 'server-cgroupe', sender: "serveur", group: msg.group, msg: `Groupe ${msg.group} créé avec succès.` });
             break;
 
         case ACTIONS.LIST_GROUPS:
             const groupNames = Array.from(groups.keys());
-            socket.write(createMessage('server-groups', "serveur", { groups: groupNames }));
+            sendToSocket(socket, { action: 'server-groups', sender: "serveur", groups: groupNames });
             break;
 
         case ACTIONS.JOIN_GROUP:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupToJoin = groups.get(msg.group);
-            if (groupToJoin.members.has(msg.sender)) return socket.write(createError('already-member', 'Déjà membre.'));
-            // Vérification du bannissement
-            if (groupToJoin.banned.has(msg.sender)) return socket.write(createError('banned', 'Vous êtes banni de ce groupe.'));
-            // Vérification de l'invitation
-            if (!groupToJoin.invited.has(msg.sender)) return socket.write(createError('not-invited', 'Vous n\'êtes pas invité dans ce groupe.'));
+            if (groupToJoin.members.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'already-member', msg: 'Déjà membre.' });
+            if (groupToJoin.banned.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'banned', msg: 'Vous êtes banni de ce groupe.' });
+            if (!groupToJoin.invited.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-invited', msg: 'Vous n\'êtes pas invité dans ce groupe.' });
             
-            groupToJoin.invited.delete(msg.sender); // On consomme l'invitation
-            groupToJoin.members.add(msg.sender);
+            groupToJoin.invited.delete(socket.session.user.name);
+            groupToJoin.members.add(socket.session.user.name);
             
             groupToJoin.members.forEach(member => {
                 const memberSocket = connectedClients.get(member);
-                if (memberSocket) memberSocket.write(createMessage('server-group-joined', "serveur", { group: msg.group, user: msg.sender }));
+                if (memberSocket) sendToSocket(memberSocket, { action: 'server-group-joined', sender: "serveur", group: msg.group, user: socket.session.user.name });
             });
             break;
 
         case ACTIONS.GROUP_MEMBERS:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupMembers = groups.get(msg.group);
-            if (!groupMembers.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
+            if (!groupMembers.members.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-member', msg: 'Vous n\'êtes pas membre.' });
             
-            socket.write(createMessage('server-members', "serveur", { group: msg.group, members: Array.from(groupMembers.members) }));
+            sendToSocket(socket, { action: 'server-members', sender: "serveur", group: msg.group, members: Array.from(groupMembers.members) });
             break;
 
         case ACTIONS.LEAVE_GROUP:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupToLeave = groups.get(msg.group);
-            if (!groupToLeave.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
+            if (!groupToLeave.members.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-member', msg: 'Vous n\'êtes pas membre.' });
             
-            groupToLeave.members.delete(msg.sender);
+            groupToLeave.members.delete(socket.session.user.name);
+            sendToSocket(socket, { action: 'server-group-left', sender: "serveur", group: msg.group, user: socket.session.user.name, reason: 'leave' });
             
-            socket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.sender, reason: 'leave' }));
             groupToLeave.members.forEach(member => {
                 const memberSocket = connectedClients.get(member);
-                if (memberSocket) memberSocket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.sender, reason: 'leave' }));
+                if (memberSocket) sendToSocket(memberSocket, { action: 'server-group-left', sender: "serveur", group: msg.group, user: socket.session.user.name, reason: 'leave' });
             });
             break;
 
         case ACTIONS.GROUP_BROADCAST:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const targetGroup = groups.get(msg.group);
             
-            if (!targetGroup.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre de ce groupe.'));
+            if (!targetGroup.members.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-member', msg: 'Vous n\'êtes pas membre de ce groupe.' });
             
-            targetGroup.messages.push({ sender: msg.sender, msg: msg.msg });
+            targetGroup.messages.push({ sender: socket.session.user.name, msg: msg.msg });
             
             let groupCount = 0;
             targetGroup.members.forEach(member => {
-                if (member !== msg.sender) {
+                if (member !== socket.session.user.name) {
                     const memberSocket = connectedClients.get(member);
                     if (memberSocket) {
-                        memberSocket.write(createMessage('server-gmessage', msg.sender, { group: msg.group, msg: msg.msg }));
+                        sendToSocket(memberSocket, { action: 'server-gmessage', sender: socket.session.user.name, group: msg.group, msg: msg.msg });
                         groupCount++;
                     }
                 }
             });
-            
-            socket.write(createMessage('server-gbroadcast', "serveur", { group: msg.group, count: groupCount }));
+            sendToSocket(socket, { action: 'server-gbroadcast', sender: "serveur", group: msg.group, count: groupCount });
             break;
 
         case ACTIONS.GROUP_MESSAGES:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupHistory = groups.get(msg.group);
+            if (!groupHistory.members.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-member', msg: 'Vous n\'êtes pas membre.' });
             
-            if (!groupHistory.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
-            
-            socket.write(createMessage('server-msgs', "serveur", { group: msg.group, msgs: groupHistory.messages }));
+            sendToSocket(socket, { action: 'server-msgs', sender: "serveur", group: msg.group, msgs: groupHistory.messages });
             break;
         
         case ACTIONS.INVITE:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupToInvite = groups.get(msg.group);
             
-            // Le contrat impose que seul le créateur puisse inviter
-            if (groupToInvite.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut inviter.'));
+            if (groupToInvite.creator !== socket.session.user.name) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-owner', msg: 'Seul le propriétaire peut inviter.' });
             
             groupToInvite.invited.add(msg.user);
-            
-            // On notifie la cible si elle est en ligne
             const invitedSocket = connectedClients.get(msg.user);
-            if (invitedSocket) {
-                invitedSocket.write(createMessage('server-invited', msg.sender, { group: msg.group }));
-            }
+            if (invitedSocket) sendToSocket(invitedSocket, { action: 'server-invited', sender: socket.session.user.name, group: msg.group });
             break;
 
         case ACTIONS.KICK:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupToKick = groups.get(msg.group);
-            if (groupToKick.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut expulser.'));
+            if (groupToKick.creator !== socket.session.user.name) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-owner', msg: 'Seul le propriétaire peut expulser.' });
             
             if (groupToKick.members.has(msg.user)) {
                 groupToKick.members.delete(msg.user);
                 
                 const kickedSocket = connectedClients.get(msg.user);
-                if (kickedSocket) kickedSocket.write(createMessage('server-kicked', msg.sender, { group: msg.group, reason: 'kick' }));
+                if (kickedSocket) sendToSocket(kickedSocket, { action: 'server-kicked', sender: socket.session.user.name, group: msg.group, reason: 'kick' });
                 
                 groupToKick.members.forEach(member => {
                     const memberSocket = connectedClients.get(member);
-                    if (memberSocket) memberSocket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.user, reason: 'kick' }));
+                    if (memberSocket) sendToSocket(memberSocket, { action: 'server-group-left', sender: "serveur", group: msg.group, user: msg.user, reason: 'kick' });
                 });
             }
             break;
 
         case ACTIONS.BAN:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupToBan = groups.get(msg.group);
-            if (groupToBan.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut bannir.'));
+            if (groupToBan.creator !== socket.session.user.name) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-owner', msg: 'Seul le propriétaire peut bannir.' });
             
             groupToBan.banned.add(msg.user);
             if (groupToBan.members.has(msg.user)) {
                 groupToBan.members.delete(msg.user);
                 
                 const bannedSocket = connectedClients.get(msg.user);
-                if (bannedSocket) bannedSocket.write(createMessage('server-banned', msg.sender, { group: msg.group, reason: 'ban' }));
+                if (bannedSocket) sendToSocket(bannedSocket, { action: 'server-banned', sender: socket.session.user.name, group: msg.group, reason: 'ban' });
                 
                 groupToBan.members.forEach(member => {
                     const memberSocket = connectedClients.get(member);
-                    if (memberSocket) memberSocket.write(createMessage('server-group-left', "serveur", { group: msg.group, user: msg.user, reason: 'ban' }));
+                    if (memberSocket) sendToSocket(memberSocket, { action: 'server-group-left', sender: "serveur", group: msg.group, user: msg.user, reason: 'ban' });
                 });
             }
             break;
 
         case ACTIONS.UNBAN:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupToUnban = groups.get(msg.group);
-            if (groupToUnban.creator !== msg.sender) return socket.write(createError('not-owner', 'Seul le propriétaire peut débannir.'));
+            if (groupToUnban.creator !== socket.session.user.name) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-owner', msg: 'Seul le propriétaire peut débannir.' });
             
             groupToUnban.banned.delete(msg.user);
             const unbannedSocket = connectedClients.get(msg.user);
-            if (unbannedSocket) unbannedSocket.write(createMessage('server-unbanned', msg.sender, { group: msg.group }));
+            if (unbannedSocket) sendToSocket(unbannedSocket, { action: 'server-unbanned', sender: socket.session.user.name, group: msg.group });
             break;
         
         case ACTIONS.STATES:
-            if (!groups.has(msg.group)) return socket.write(createError('group-not-found', 'Groupe introuvable.'));
+            if (!groups.has(msg.group)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'group-not-found', msg: 'Groupe introuvable.' });
             const groupState = groups.get(msg.group);
+            if (!groupState.members.has(socket.session.user.name)) return sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'not-member', msg: 'Vous n\'êtes pas membre.' });
             
-            // Le contrat réserve l'action states aux membres
-            if (!groupState.members.has(msg.sender)) return socket.write(createError('not-member', 'Vous n\'êtes pas membre.'));
-            
-            socket.write(createMessage('server-states', "serveur", { 
-                group: msg.group, 
-                owner: groupState.creator,
-                members: Array.from(groupState.members),
-                invited: Array.from(groupState.invited),
-                banned: Array.from(groupState.banned)
-            }));
+            sendToSocket(socket, { action: 'server-states', sender: "serveur", group: msg.group, owner: groupState.creator, members: Array.from(groupState.members), invited: Array.from(groupState.invited), banned: Array.from(groupState.banned) });
             break;
 
         default:
-            socket.write(createError('unknown-action', 'Action non reconnue.'));
+            sendToSocket(socket, { action: ACTIONS.SRV_ERROR, code: 'unknown-action', msg: 'Action non reconnue.' });
             break;
     }
 }
 
-server.listen(PORT, HOST, () => {
-    debug(`Server listening on ${HOST}:${PORT}`);
-}); 
+initDatabase()
+  .then(() => {
+    debug('Base de données initialisée avec succès.');
+    server.listen(PORT, HOST, () => {
+      debug(`Server listening on ${HOST}:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Erreur lors de l\'initialisation de la BDD :', err);
+  });

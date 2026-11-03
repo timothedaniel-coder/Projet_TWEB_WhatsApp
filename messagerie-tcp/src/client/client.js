@@ -5,6 +5,7 @@ const readline = require('readline');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 const { ACTIONS, createMessage, COMMANDS } = require('../common/protocol.js');
+const { generateKeyPair, deriveSessionKeys, encryptMessage, decryptMessage } = require('../common/crypto.js');
 
 const debug = util.debuglog('client');
 const argv = yargs(hideBin(process.argv)).argv;
@@ -18,11 +19,44 @@ const rl = readline.createInterface({
     prompt: chalk.magenta('> ')
 });
 
+// État de la session cryptographique du client
+const session = {
+    ecdh: null,
+    keys: null,
+    seqIn: 0,
+    seqOut: 0
+};
+
+// 1. Initialisation de la connexion et envoi de la clé publique ECDH (non chiffré)
 client.connect(PORT, HOST, function() {
-    console.log(chalk.green.bold('Connecté au serveur'));
-    client.write(createMessage(ACTIONS.HELLO, argv.name));
-    rl.prompt();
+    console.log(chalk.green.bold('Connecté au serveur TCP.'));
+    
+    // Génération de la paire de clés ECDH côté client
+    const keyPair = generateKeyPair();
+    session.ecdh = keyPair.ecdh;
+    
+    // Envoi de la requête KEY_EXCHANGE
+    console.log(chalk.gray('Négociation des clés de chiffrement en cours...'));
+    const payload = { action: ACTIONS.KEY_EXCHANGE, publicKey: keyPair.publicKeyHex };
+    client.write(JSON.stringify(payload) + '\n');
 });
+
+/**
+ * Fonction utilitaire pour envoyer un message chiffré au serveur.
+ */
+function sendToServer(action, extraFields = {}) {
+    const payload = { action, sender: argv.name, ...extraFields };
+    
+    if (session.keys) {
+        // Envoi chiffré si le handshake est terminé
+        const encryptedJson = encryptMessage(payload, session.keys.encKey, session.keys.macKey, session.seqOut);
+        session.seqOut++;
+        client.write(encryptedJson + '\n');
+    } else {
+        // Envoi en clair (uniquement pendant le handshake)
+        client.write(JSON.stringify(payload) + '\n');
+    }
+}
 
 let buffer = '';
 
@@ -36,17 +70,54 @@ client.on('data', function(data) {
         
         if (messageStr) {
             try {
-                const parsedData = JSON.parse(messageStr);
+                let parsedData;
                 
+                // 2. Interception de la réponse serveur (Handshake)
+                if (!session.keys) {
+                    parsedData = JSON.parse(messageStr);
+                    if (parsedData.action === ACTIONS.SRV_KEY_EXCHANGE) {
+                        session.keys = deriveSessionKeys(session.ecdh, parsedData.publicKey);
+                        console.log(chalk.green.bold('Canal sécurisé établi avec succès !'));
+                        console.log(chalk.yellow('Veuillez vous inscrire (register;votremotdepasse) ou vous connecter (login;votremotdepasse).'));
+                        rl.prompt();
+                    } else if (parsedData.action === ACTIONS.SRV_ERROR) {
+                        console.log(chalk.red(`Erreur serveur : ${parsedData.msg}`));
+                    }
+                } 
+                // 3. Déchiffrement de tous les messages suivants
+                else {
+                    parsedData = decryptMessage(messageStr, session.keys.encKey, session.keys.macKey, session.seqIn);
+                    session.seqIn++;
+                }
+
+                if (!parsedData || parsedData.action === ACTIONS.SRV_KEY_EXCHANGE) {
+                    boundary = buffer.indexOf('\n');
+                    continue;
+                }
+
                 process.stdout.clearLine();
                 process.stdout.cursorTo(0);
                 
                 switch (parsedData.action) {
+                    case ACTIONS.SRV_AUTH_OK:
+                        console.log(chalk.green.bold(parsedData.msg));
+                        break;
+                    case ACTIONS.SRV_HISTORY:
+                        console.log(chalk.cyan(`\n--- Votre Historique ---`));
+                        if (parsedData.history && parsedData.history.length > 0) {
+                            parsedData.history.forEach(m => {
+                                console.log(chalk.cyan(`[${m.created_at}] ${m.kind} : ${m.body}`));
+                            });
+                        } else {
+                            console.log(chalk.gray('Aucun historique.'));
+                        }
+                        console.log(chalk.cyan(`------------------------\n`));
+                        break;
                     case ACTIONS.SRV_JOINED:
-                        console.log(chalk.yellow(`${parsedData.user} a rejoint le serveur.`));
+                        console.log(chalk.yellow(`${parsedData.user} s'est connecté.`));
                         break;
                     case ACTIONS.SRV_LEFT:
-                        console.log(chalk.yellow(`${parsedData.user} a quitté le serveur.`));
+                        console.log(chalk.yellow(`${parsedData.user} s'est déconnecté.`));
                         break;
                     case ACTIONS.SRV_SEND_ACK:
                         console.log(chalk.gray(`Message bien envoyé à ${parsedData.dest}.`));
@@ -66,6 +137,8 @@ client.on('data', function(data) {
                     case ACTIONS.SRV_BROADCAST:
                         console.log(chalk.cyan(`[Diffusion de ${parsedData.sender}] : ${parsedData.msg}`));
                         break;
+
+                    // --- PARTIE 2 : Groupes ---
                     case 'server-cgroupe':
                         console.log(chalk.green(`${parsedData.msg}`));
                         break;
@@ -129,7 +202,7 @@ client.on('data', function(data) {
                         break;
                 }
             } catch (e) {
-                debug('Erreur JSON côté client : ' + e.message);
+                debug('Erreur ou échec de déchiffrement : ' + e.message);
             }
         }
         boundary = buffer.indexOf('\n');
@@ -137,88 +210,85 @@ client.on('data', function(data) {
     rl.prompt();
 });
 
+// Traitement des commandes de l'utilisateur (on utilise sendToServer pour chiffrer l'envoi)
 rl.on('line', (line) => {
     const text = line.trim();
     
-    if (text === COMMANDS.HELLO) {
-        client.write(createMessage(ACTIONS.HELLO, argv.name));
+    // --- PARTIE 3 : Commandes d'authentification ---
+    if (text.startsWith(COMMANDS.REGISTER)) {
+        const password = text.substring(COMMANDS.REGISTER.length).trim();
+        if (password) sendToServer(ACTIONS.REGISTER, { password });
+        else console.log(chalk.red('Format attendu: register;motdepasse'));
+    }
+    else if (text.startsWith(COMMANDS.LOGIN)) {
+        const password = text.substring(COMMANDS.LOGIN.length).trim();
+        if (password) sendToServer(ACTIONS.LOGIN, { password });
+        else console.log(chalk.red('Format attendu: login;motdepasse'));
+    }
+    else if (text === COMMANDS.HISTORY) {
+        sendToServer(ACTIONS.HISTORY);
+    }
+    // --- Commandes historiques (Partie 1 et 2) ---
+    else if (text === COMMANDS.HELLO) {
+        sendToServer(ACTIONS.HELLO);
     } 
     else if (text.startsWith(COMMANDS.SEND)) {
         const parts = text.split(';');         
         if (parts.length >= 3) {
-            const dest = parts[1];
-            const message = parts.slice(2).join(';');
-            client.write(createMessage(ACTIONS.SEND, argv.name, { msg: message, dest: dest }));
+            sendToServer(ACTIONS.SEND, { msg: parts.slice(2).join(';'), dest: parts[1] });
+        } else {
+            console.log(chalk.red('Format attendu: send;destinataire;message'));
         }
     }
     else if (text.startsWith(COMMANDS.BROADCAST)) {
         const message = text.substring(COMMANDS.BROADCAST.length);
-        client.write(createMessage(ACTIONS.BROADCAST, argv.name, { msg: message }));
+        sendToServer(ACTIONS.BROADCAST, { msg: message });
     }
     else if (text === COMMANDS.LIST) {
-        client.write(createMessage(ACTIONS.LIST, argv.name));
+        sendToServer(ACTIONS.LIST);
     }
     else if (text.startsWith(COMMANDS.CREATE_GROUP)) {
         const groupName = text.substring(COMMANDS.CREATE_GROUP.length).trim();
-        if (groupName) {
-            client.write(createMessage(ACTIONS.CREATE_GROUP, argv.name, { group: groupName }));
-        } else {
-            console.log(chalk.red('Erreur : veuillez spécifier un nom de groupe'));
-        }
+        if (groupName) sendToServer(ACTIONS.CREATE_GROUP, { group: groupName });
     }
     else if (text === COMMANDS.GROUPS) {
-        client.write(createMessage(ACTIONS.LIST_GROUPS, argv.name));
-    }
-    else if (text === COMMANDS.QUIT) {
-        client.write(createMessage(ACTIONS.QUIT, argv.name));
-        client.end();
-        process.exit(0);
+        sendToServer(ACTIONS.LIST_GROUPS);
     }
     else if (text.startsWith(COMMANDS.JOIN_GROUP)) {
-        client.write(createMessage(ACTIONS.JOIN_GROUP, argv.name, { group: text.substring(COMMANDS.JOIN_GROUP.length).trim() }));
+        sendToServer(ACTIONS.JOIN_GROUP, { group: text.substring(COMMANDS.JOIN_GROUP.length).trim() });
     }
     else if (text.startsWith(COMMANDS.GROUP_MEMBERS)) {
-        client.write(createMessage(ACTIONS.GROUP_MEMBERS, argv.name, { group: text.substring(COMMANDS.GROUP_MEMBERS.length).trim() }));
+        sendToServer(ACTIONS.GROUP_MEMBERS, { group: text.substring(COMMANDS.GROUP_MEMBERS.length).trim() });
     }
     else if (text.startsWith(COMMANDS.LEAVE_GROUP)) {
-        client.write(createMessage(ACTIONS.LEAVE_GROUP, argv.name, { group: text.substring(COMMANDS.LEAVE_GROUP.length).trim() }));
+        sendToServer(ACTIONS.LEAVE_GROUP, { group: text.substring(COMMANDS.LEAVE_GROUP.length).trim() });
     }
     else if (text.startsWith(COMMANDS.GROUP_BROADCAST)) {
         const parts = text.split(';');         
-        if (parts.length >= 3) {
-            const groupName = parts[1];
-            const message = parts.slice(2).join(';');
-            client.write(createMessage(ACTIONS.GROUP_BROADCAST, argv.name, { group: groupName, msg: message }));
-        } else {
-            console.log(chalk.red('Erreur : format attendu gbroadcast;groupe;message'));
-        }
+        if (parts.length >= 3) sendToServer(ACTIONS.GROUP_BROADCAST, { group: parts[1], msg: parts.slice(2).join(';') });
     }
     else if (text.startsWith(COMMANDS.GROUP_MESSAGES)) {
-        client.write(createMessage(ACTIONS.GROUP_MESSAGES, argv.name, { group: text.substring(COMMANDS.GROUP_MESSAGES.length).trim() }));
+        sendToServer(ACTIONS.GROUP_MESSAGES, { group: text.substring(COMMANDS.GROUP_MESSAGES.length).trim() });
     }
     else if (text.startsWith(COMMANDS.INVITE)) {
         const parts = text.split(';');         
-        if (parts.length >= 3) {
-            client.write(createMessage(ACTIONS.INVITE, argv.name, { group: parts[1], user: parts[2] }));
-        } else {
-            console.log(chalk.red('Erreur : format attendu invite;groupe;pseudo'));
-        }
+        if (parts.length >= 3) sendToServer(ACTIONS.INVITE, { group: parts[1], user: parts[2] });
     }
     else if (text.startsWith(COMMANDS.KICK) || text.startsWith(COMMANDS.BAN) || text.startsWith(COMMANDS.UNBAN)) {
         const parts = text.split(';');
         if (parts.length >= 3) {
-            let action;
-            if (text.startsWith(COMMANDS.KICK)) action = ACTIONS.KICK;
-            else if (text.startsWith(COMMANDS.BAN)) action = ACTIONS.BAN;
-            else action = ACTIONS.UNBAN;
-            
-            client.write(createMessage(action, argv.name, { group: parts[1], user: parts[2] }));
-        } else {
-            console.log(chalk.red('Erreur : format attendu action;groupe;pseudo'));
+            let action = text.startsWith(COMMANDS.KICK) ? ACTIONS.KICK 
+                       : text.startsWith(COMMANDS.BAN) ? ACTIONS.BAN : ACTIONS.UNBAN;
+            sendToServer(action, { group: parts[1], user: parts[2] });
         }
     }
     else if (text.startsWith(COMMANDS.STATES)) {
-        client.write(createMessage(ACTIONS.STATES, argv.name, { group: text.substring(COMMANDS.STATES.length).trim() }));
+        sendToServer(ACTIONS.STATES, { group: text.substring(COMMANDS.STATES.length).trim() });
+    }
+    else if (text === COMMANDS.QUIT) {
+        sendToServer(ACTIONS.QUIT);
+        client.end();
+        process.exit(0);
     }
     rl.prompt();
 });

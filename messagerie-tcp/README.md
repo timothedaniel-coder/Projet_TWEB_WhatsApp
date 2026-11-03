@@ -3,6 +3,7 @@
 Application de messagerie en ligne de commande basée sur des **sockets TCP**, développée avec **Node.js**.
 
 Elle permet à plusieurs utilisateurs de se connecter à un serveur central, d'échanger des messages privés, de diffuser des messages publics, mais aussi de créer et gérer des **groupes de discussion privés** avec un système complet de modération.
+Grâce aux dernières mises à jour, l'application intègre désormais une **base de données persistante (SQLite)** et un **chiffrement de bout en bout (ECDH + AES-256)** pour garantir la sécurité des échanges.
 
 ---
 
@@ -11,9 +12,11 @@ Elle permet à plusieurs utilisateurs de se connecter à un serveur central, d'�
 - [Prérequis](#-prérequis)
 - [Lancement](#-lancement)
 - [Commandes utilisateur](#-commandes-utilisateur)
+  - [Authentification & Historique](#authentification--historique)
   - [Général & Messages directs](#général--messages-directs)
   - [Groupes & Modération](#groupes--modération)
 - [Protocole client-serveur](#-protocole-client-serveur)
+  - [Sécurité et Chiffrement](#sécurité-et-chiffrement)
   - [Transport et cadrage](#transport-et-cadrage)
   - [Format des erreurs](#format-des-erreurs)
   - [Principales actions JSON](#principales-actions-json)
@@ -23,6 +26,11 @@ Elle permet à plusieurs utilisateurs de se connecter à un serveur central, d'�
 ## 🔧 Prérequis
 
 - [Node.js](https://nodejs.org/) installé sur votre machine
+- Dépendances du projet (SQLite et Bcrypt) à installer via la commande :
+  
+```bash
+  npm install sqlite3 bcrypt
+```
 
 ## 🚀 Lancement
 
@@ -38,11 +46,20 @@ node src/server/server.js
 node src/client/client.js --name=votre_pseudo
 ```
 
-> 💡 Vous pouvez lancer autant de clients que souhaité, chacun avec un pseudo différent.
+> 💡 Vous pouvez lancer autant de clients que souhaité, chacun avec un pseudo différent. Au lancement, le client négociera automatiquement un canal sécurisé avant de vous inviter à vous authentifier.
 
 ---
 
 ## ⌨️ Commandes utilisateur
+
+### Authentification & Historique
+*(Nouveautés de la Partie 3)*
+
+| Commande | Description |
+| :--- | :--- |
+| `register;motdepasse` | Créer un nouveau compte. Le mot de passe est haché avant d'être stocké. |
+| `login;motdepasse` | Se connecter à un compte existant. |
+| `history;` | Afficher l'historique de vos messages récupérés depuis la base de données. |
 
 ### Général & Messages directs
 
@@ -79,6 +96,10 @@ node src/client/client.js --name=votre_pseudo
 
 Le projet respecte un contrat d'interopérabilité strict permettant à différents clients et serveurs de communiquer entre eux.
 
+### Sécurité et Chiffrement
+Avant tout échange métier, le client et le serveur effectuent un handshake **ECDH** (courbe `prime256v1`) non chiffré via les actions `client-key-exchange` et `server-key-exchange`. 
+Une fois les clés dérivées, **l'intégralité des messages JSON suivants est chiffrée** (AES-256-CBC) et signée (HMAC-SHA256) pour garantir la confidentialité et l'intégrité des échanges.
+
 ### Transport et cadrage
 
 | Élément | Détail |
@@ -99,11 +120,13 @@ Toute erreur serveur respecte la structure JSON suivante :
   "msg": "Message d'explication lisible par l'humain"
 }
 ```
-*Exemples de codes : `not-registered`, `already-registered`, `group-not-found`, `not-member`, `not-owner`, `banned`, `not-invited`.*
+*Exemples de codes : `not-registered`, `already-registered`, `group-not-found`, `not-member`, `not-owner`, `banned`, `not-invited`, `invalid-credentials`.*
 
 ### Principales actions JSON
 
 **Quelques requêtes Client → Serveur**
+*   `client-register` : `{"action": "client-register", "sender": "alice", "password": "pass"}`
+*   `client-login` : `{"action": "client-login", "sender": "alice", "password": "pass"}`
 *   `client-hello` : `{"action": "client-hello", "sender": "alice"}`
 *   `client-send` : `{"action": "client-send", "sender": "alice", "dest": "bob", "msg": "Salut !"}`
 *   `cgroupe` : `{"action": "cgroupe", "sender": "alice", "group": "wob"}`
@@ -111,6 +134,8 @@ Toute erreur serveur respecte la structure JSON suivante :
 *   `gbroadcast` : `{"action": "gbroadcast", "sender": "alice", "group": "wob", "msg": "Hello"}`
 
 **Quelques réponses / événements Serveur → Client**
+*   `server-auth-ok` : Validation de l'authentification (inscription ou connexion).
+*   `server-history` : Restitution de l'historique du compte depuis la base SQLite.
 *   `server-user-joined` / `server-user-left` : Notification globale de connexion/déconnexion.
 *   `server-send-ack` / `server-broadcast-ack` : Accusés de réception des messages.
 *   `server-groups` : Renvoie la liste des groupes existants.

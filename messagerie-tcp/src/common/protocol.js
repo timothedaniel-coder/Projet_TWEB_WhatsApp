@@ -30,7 +30,16 @@ const ACTIONS = {
     KICK: 'kick',
     BAN: 'ban',
     UNBAN: 'unban',
-    STATES: 'states'
+    STATES: 'states',
+
+    // ---- PARTIE 3 ----
+    KEY_EXCHANGE: 'client-key-exchange',  // Envoi de la clé publique ECDH client
+    SRV_KEY_EXCHANGE: 'server-key-exchange', // Réponse avec clé publique ECDH serveur
+    REGISTER: 'client-register',           // Inscription (pseudo + mot de passe)
+    LOGIN: 'client-login',                 // Connexion (pseudo + mot de passe)
+    SRV_AUTH_OK: 'server-auth-ok',         // Validation de l'authentification
+    HISTORY: 'client-history',             // Demande de l'historique
+    SRV_HISTORY: 'server-history'          // Envoi de l'historique
 };
 
 // 2. Module de construction des messages
@@ -69,7 +78,12 @@ const COMMANDS = {
     KICK: 'kick;',
     BAN: 'ban;',
     UNBAN: 'unban;',
-    STATES: 'states;'
+    STATES: 'states;',
+
+    // Commandes Partie 3
+    REGISTER: 'register;',
+    LOGIN: 'login;',
+    HISTORY: 'history;'
 };
 
 module.exports = { ACTIONS, createMessage, createError, COMMANDS };
